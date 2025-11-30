@@ -1414,7 +1414,16 @@ int InitPlatform(void)
     EGLint numConfigs = 0;
 
     // Get an EGL device connection
-    platform.device = eglGetDisplay((EGLNativeDisplayType)platform.gbmDevice);
+    PFNEGLGETPLATFORMDISPLAYEXTPROC getPlatformDisplay = (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
+    if (getPlatformDisplay)
+    {
+        platform.device = getPlatformDisplay(EGL_PLATFORM_GBM_KHR, (void *)platform.gbmDevice, NULL);
+    }
+    else
+    {
+        TRACELOG(LOG_TRACE, "DISPLAY: Falling back to eglGetDisplay");
+        platform.device = eglGetDisplay((EGLNativeDisplayType)platform.gbmDevice);
+    }
     if (platform.device == EGL_NO_DISPLAY)
     {
         TRACELOG(LOG_WARNING, "DISPLAY: Failed to initialize EGL device");
