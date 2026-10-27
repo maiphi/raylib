@@ -128,7 +128,8 @@ typedef struct {
     bool eventKeyboardMode;             // Keyboard in event mode
     int defaultFileFlags;               // Default IO file flags
     struct termios defaultSettings;     // Default keyboard settings
-    int keyboardFd;                     // File descriptor for the evdev keyboard
+    int *keyboardFds;                   // File descriptors for the evdev keyboards
+    int keyboardCount;                  // The number of keyboards registered
 
     // Mouse data
     Vector2 eventWheelMove;             // Registers the event mouse wheel variation
@@ -263,6 +264,7 @@ static void ProcessKeyboard(void);              // Process keyboard events
 static void InitEvdevInput(void);               // Initialize evdev inputs
 static void ConfigureEvdevDevice(char *device); // Identifies a input device and configures it for use if appropriate
 static void PollKeyboardEvents(void);           // Process evdev keyboard events
+static void PollKeyboardDeviceEvents(int fd);   // Process the evdev events of one keyboard
 static void PollGamepadEvents(void);            // Process evdev gamepad events
 static void PollMouseEvents(void);              // Process evdev mouse events
 
@@ -1724,11 +1726,10 @@ void ClosePlatform(void)
         platform.gamepadStreamFd[i] = -1;
     }
 
-    if (platform.keyboardFd != -1)
-    {
-        close(platform.keyboardFd);
-        platform.keyboardFd = -1;
-    }
+    for (int i = 0; i < platform.keyboardCount; i++) close(platform.keyboardFds[i]);
+    RL_FREE(platform.keyboardFds);
+    platform.keyboardFds = NULL;
+    platform.keyboardCount = 0;
 }
 
 #if SUPPORT_SSH_KEYBOARD_RPI
@@ -1906,8 +1907,9 @@ static void InitEvdevInput(void)
     DIR *directory = NULL;
     struct dirent *entity = NULL;
 
-    // Initialize keyboard file descriptor
-    platform.keyboardFd = -1;
+    // Initialize keyboard and mouse file descriptors
+    platform.keyboardFds = NULL;
+    platform.keyboardCount = 0;
     platform.mouseFd = -1;
 
     // Reset variables
@@ -2162,10 +2164,22 @@ static void ConfigureEvdevDevice(char *device)
             }
         }
     }
-    else if (isKeyboard && (platform.keyboardFd == -1))
+    else if (isKeyboard)
     {
+        // Several devices can be keyboards, e.g. a second interface of the same keyboard that only
+        // sends multimedia keys, so all of them are read
+        int *keyboardFds = (int *)RL_REALLOC(platform.keyboardFds, (platform.keyboardCount + 1)*sizeof(int));
+        if (keyboardFds == NULL)
+        {
+            TRACELOG(LOG_WARNING, "INPUT: Failed to allocate memory for keyboard device %s", device);
+            close(fd);
+            return;
+        }
+
         deviceKindStr = "keyboard";
-        platform.keyboardFd = fd;
+        keyboardFds[platform.keyboardCount] = fd;
+        platform.keyboardFds = keyboardFds;
+        platform.keyboardCount++;
     }
     else
     {
@@ -2179,9 +2193,12 @@ static void ConfigureEvdevDevice(char *device)
 // Poll and process evdev keyboard events
 static void PollKeyboardEvents(void)
 {
-    int fd = platform.keyboardFd;
-    if (fd == -1) return;
+    for (int i = 0; i < platform.keyboardCount; i++) PollKeyboardDeviceEvents(platform.keyboardFds[i]);
+}
 
+// Poll and process the evdev events of one keyboard
+static void PollKeyboardDeviceEvents(int fd)
+{
     struct input_event event = { 0 };
     int keycode = -1;
 
