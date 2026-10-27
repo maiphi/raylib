@@ -52,7 +52,10 @@
 #include <dirent.h>         // POSIX directory browsing
 #include <limits.h>         // INT_MAX
 
+#include <errno.h>          // Required for: errno, ENODEV
 #include <sys/ioctl.h>      // Required for: ioctl() - UNIX System call for device-specific input/output operations
+#include <sys/inotify.h>    // Required for: inotify_init1(), inotify_add_watch() - detection of added input devices
+#include <sys/stat.h>       // Required for: stat(), fstat() - identification of already opened input devices
 #include <linux/kd.h>       // Linux: KDSKBMODE, K_MEDIUMRAM constants definition
 #include <linux/input.h>    // Linux: Keycodes constants definition (KEY_A, ...)
 #include <linux/joystick.h> // Linux: Joystick support library
@@ -96,6 +99,7 @@
 #define USE_LAST_TOUCH_DEVICE           // When multiple touchscreens are connected, only use the one with the highest event<N> number
 
 #define DEFAULT_EVDEV_PATH "/dev/input/"    // Path to the linux input events
+#define DEFAULT_DEV_PATH "/dev/"            // Path of the linux devices, DEFAULT_EVDEV_PATH is created there with the first input device
 
 // Actually biggest key is KEY_CNT but only mapping keys up to KEY_ALS_TOGGLE
 #define KEYMAP_SIZE KEY_ALS_TOGGLE
@@ -151,6 +155,11 @@ typedef struct {
     bool touchActive[MAX_TOUCH_POINTS]; // Track which touch points are currently active
     Vector2 touchPosition[MAX_TOUCH_POINTS]; // Track touch positions for each slot
     int touchId[MAX_TOUCH_POINTS];      // Track touch IDs for each slot
+
+    // Input devices hotplugging
+    int inotifyFd;                      // inotify instance to detect added input devices
+    int devWatch;                       // inotify watch of DEFAULT_DEV_PATH, to detect the creation of DEFAULT_EVDEV_PATH
+    int evdevWatch;                     // inotify watch of DEFAULT_EVDEV_PATH, -1 while it does not exist
 
     // Gamepad data
     int gamepadStreamFd[MAX_GAMEPADS];  // Gamepad device file descriptor
@@ -270,12 +279,18 @@ static void ProcessKeyboard(void);              // Process keyboard events
 
 // Input management functions
 static void InitEvdevInput(void);               // Initialize evdev inputs
+static void WatchEvdevDirectory(void);          // Watch DEFAULT_EVDEV_PATH for added input devices, if it exists
+static void ScanEvdevDevices(void);             // Configure all input devices in DEFAULT_EVDEV_PATH that are not open yet
+static bool IsEvdevDeviceName(const char *name); // Check if a file name in DEFAULT_EVDEV_PATH is an input device
+static bool IsEvdevDeviceOpen(const char *device); // Check if an input device is already open
+static void PollEvdevHotplug(void);             // Configure added input devices
 static void ConfigureEvdevDevice(char *device); // Identifies a input device and configures it for use if appropriate
 static void PollKeyboardEvents(void);           // Process evdev keyboard events
-static void PollKeyboardDeviceEvents(int fd);   // Process the evdev events of one keyboard
+static bool PollKeyboardDeviceEvents(int fd);   // Process the evdev events of one keyboard, true if it was removed
 static void PollGamepadEvents(void);            // Process evdev gamepad events
 static void PollMouseEvents(void);              // Process evdev mouse events
-static void PollMouseDeviceEvents(PointerDevice *pointer); // Process the evdev events of one mouse or touchscreen
+static bool PollMouseDeviceEvents(PointerDevice *pointer); // Process the evdev events of one mouse or touchscreen, true if it was removed
+static void ReleasePointerInput(void);          // Release all mouse buttons and touch points
 static void AddPointerDevice(int fd, bool isTouch, Rectangle absRange, const char *phys, const char *device); // Register a mouse or touchscreen
 static void RemovePointerDevice(int index);     // Close and unregister a mouse or touchscreen
 
@@ -1133,6 +1148,9 @@ void PollInputEvents(void)
 
     // Handle the mouse/touch/gestures events:
     PollMouseEvents();
+
+    // Configure added input devices, after polling: a removed device is closed then, even if its event node is already reused
+    PollEvdevHotplug();
 }
 
 //----------------------------------------------------------------------------------
@@ -1732,8 +1750,16 @@ void ClosePlatform(void)
 
     for (int i = 0; i < platform.gamepadCount; i++)
     {
-        close(platform.gamepadStreamFd[i]);
+        if (platform.gamepadStreamFd[i] != -1) close(platform.gamepadStreamFd[i]);
         platform.gamepadStreamFd[i] = -1;
+    }
+
+    if (platform.inotifyFd != -1)
+    {
+        close(platform.inotifyFd);
+        platform.inotifyFd = -1;
+        platform.devWatch = -1;
+        platform.evdevWatch = -1;
     }
 
     for (int i = 0; i < platform.keyboardCount; i++) close(platform.keyboardFds[i]);
@@ -1913,10 +1939,6 @@ static void ProcessKeyboard(void)
 // this means mouse, keyboard or gamepad devices
 static void InitEvdevInput(void)
 {
-    char path[MAX_FILEPATH_LENGTH] = { 0 };
-    DIR *directory = NULL;
-    struct dirent *entity = NULL;
-
     // Initialize keyboard and mouse file descriptors
     platform.keyboardFds = NULL;
     platform.keyboardCount = 0;
@@ -1941,6 +1963,41 @@ static void InitEvdevInput(void)
         CORE.Input.Keyboard.keyRepeatInFrame[i] = 0;
     }
 
+    // Watch for added input devices before scanning, so no device is missed in between
+    platform.devWatch = -1;
+    platform.evdevWatch = -1;
+    platform.inotifyFd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+
+    if (platform.inotifyFd != -1)
+    {
+        // DEFAULT_EVDEV_PATH only exists while an input device is connected
+        platform.devWatch = inotify_add_watch(platform.inotifyFd, DEFAULT_DEV_PATH, IN_CREATE);
+        if (platform.devWatch == -1) TRACELOG(LOG_WARNING, "INPUT: Failed to watch %s, input devices connected first are not detected", DEFAULT_DEV_PATH);
+
+        WatchEvdevDirectory();
+    }
+    else TRACELOG(LOG_WARNING, "INPUT: Failed to initialize inotify, input devices connected later are not detected");
+
+    ScanEvdevDevices();
+}
+
+// Watch DEFAULT_EVDEV_PATH for added input devices, if it exists
+static void WatchEvdevDirectory(void)
+{
+    if ((platform.inotifyFd == -1) || (platform.evdevWatch != -1)) return;
+
+    // NOTE: udev sets the permissions of a device after creating its node (IN_ATTRIB),
+    // until then, it may not be readable
+    platform.evdevWatch = inotify_add_watch(platform.inotifyFd, DEFAULT_EVDEV_PATH, IN_CREATE | IN_ATTRIB);
+}
+
+// Configure all input devices in DEFAULT_EVDEV_PATH that are not open yet
+static void ScanEvdevDevices(void)
+{
+    char path[MAX_FILEPATH_LENGTH] = { 0 };
+    DIR *directory = NULL;
+    struct dirent *entity = NULL;
+
     // Open the linux directory of "/dev/input"
     directory = opendir(DEFAULT_EVDEV_PATH);
 
@@ -1948,17 +2005,93 @@ static void InitEvdevInput(void)
     {
         while ((entity = readdir(directory)) != NULL)
         {
-            if ((strncmp("event", entity->d_name, strlen("event")) == 0) ||     // Search for devices named "event*"
-                (strncmp("mouse", entity->d_name, strlen("mouse")) == 0))       // Search for devices named "mouse*"
+            if (IsEvdevDeviceName(entity->d_name))
             {
                 snprintf(path, MAX_FILEPATH_LENGTH, "%s%s", DEFAULT_EVDEV_PATH, entity->d_name);
-                ConfigureEvdevDevice(path);                                     // Configure the device if appropriate
+                if (!IsEvdevDeviceOpen(path)) ConfigureEvdevDevice(path);       // Configure the device if appropriate
             }
         }
 
         closedir(directory);
     }
     else TRACELOG(LOG_WARNING, "INPUT: Failed to open linux event directory: %s", DEFAULT_EVDEV_PATH);
+}
+
+// Check if a file name in DEFAULT_EVDEV_PATH is an input device
+static bool IsEvdevDeviceName(const char *name)
+{
+    return (strncmp("event", name, strlen("event")) == 0) ||    // Search for devices named "event*"
+           (strncmp("mouse", name, strlen("mouse")) == 0);      // Search for devices named "mouse*"
+}
+
+// Check if an input device is already open, comparing device numbers
+static bool IsEvdevDeviceOpen(const char *device)
+{
+    struct stat deviceStat = { 0 };
+    if (stat(device, &deviceStat) != 0) return false;
+
+    struct stat fdStat = { 0 };
+    #define IS_SAME_DEVICE(fd) ((fstat((fd), &fdStat) == 0) && (fdStat.st_rdev == deviceStat.st_rdev))
+
+    for (int i = 0; i < platform.keyboardCount; i++) if (IS_SAME_DEVICE(platform.keyboardFds[i])) return true;
+    for (int i = 0; i < platform.pointerCount; i++) if (IS_SAME_DEVICE(platform.pointers[i].fd)) return true;
+    for (int i = 0; i < platform.gamepadCount; i++)
+    {
+        if ((platform.gamepadStreamFd[i] != -1) && IS_SAME_DEVICE(platform.gamepadStreamFd[i])) return true;
+    }
+
+    #undef IS_SAME_DEVICE
+
+    return false;
+}
+
+// Configure added input devices
+static void PollEvdevHotplug(void)
+{
+    if (platform.inotifyFd == -1) return;
+
+    // NOTE: The buffer must be aligned for struct inotify_event, see inotify(7)
+    char buffer[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
+    char path[MAX_FILEPATH_LENGTH] = { 0 };
+    int length = 0;
+
+    while ((length = (int)read(platform.inotifyFd, buffer, sizeof(buffer))) > 0)
+    {
+        for (char *ptr = buffer; ptr < buffer + length; )
+        {
+            const struct inotify_event *event = (const struct inotify_event *)ptr;
+            ptr += sizeof(struct inotify_event) + event->len;
+
+            // Events were lost: configure all devices not open yet
+            if (FLAG_IS_SET(event->mask, IN_Q_OVERFLOW))
+            {
+                WatchEvdevDirectory();
+                ScanEvdevDevices();
+            }
+            else if ((event->wd == platform.devWatch) && (event->len > 0))
+            {
+                // DEFAULT_EVDEV_PATH was created with the first input device: watch it and configure the
+                // devices already created in it
+                if (FLAG_IS_SET(event->mask, IN_ISDIR) && (strcmp(event->name, "input") == 0))
+                {
+                    WatchEvdevDirectory();
+                    ScanEvdevDevices();
+                }
+            }
+            else if (event->wd == platform.evdevWatch)
+            {
+                // DEFAULT_EVDEV_PATH was removed with the last input device
+                if (FLAG_IS_SET(event->mask, IN_IGNORED)) platform.evdevWatch = -1;
+                else if ((event->len > 0) && IsEvdevDeviceName(event->name))
+                {
+                    snprintf(path, MAX_FILEPATH_LENGTH, "%s%s", DEFAULT_EVDEV_PATH, event->name);
+
+                    // Not readable yet if udev has not set its permissions, it is retried on IN_ATTRIB
+                    if ((access(path, R_OK) == 0) && !IsEvdevDeviceOpen(path)) ConfigureEvdevDevice(path);
+                }
+            }
+        }
+    }
 }
 
 // Identifies a input device and configures it for use if appropriate
@@ -2193,17 +2326,31 @@ static void ConfigureEvdevDevice(char *device)
 // Poll and process evdev keyboard events
 static void PollKeyboardEvents(void)
 {
-    for (int i = 0; i < platform.keyboardCount; i++) PollKeyboardDeviceEvents(platform.keyboardFds[i]);
+    for (int i = 0; i < platform.keyboardCount; )
+    {
+        if (PollKeyboardDeviceEvents(platform.keyboardFds[i]))
+        {
+            TRACELOG(LOG_INFO, "INPUT: Keyboard disconnected");
+            close(platform.keyboardFds[i]);
+            platform.keyboardCount--;
+            if (i < platform.keyboardCount) platform.keyboardFds[i] = platform.keyboardFds[platform.keyboardCount];
+
+            // Release all keys, the keys held on the disconnected keyboard are not known
+            for (int k = 0; k < MAX_KEYBOARD_KEYS; k++) CORE.Input.Keyboard.currentKeyState[k] = 0;
+        }
+        else i++;
+    }
 }
 
-// Poll and process the evdev events of one keyboard
-static void PollKeyboardDeviceEvents(int fd)
+// Poll and process the evdev events of one keyboard, returns true if the keyboard was removed
+static bool PollKeyboardDeviceEvents(int fd)
 {
     struct input_event event = { 0 };
     int keycode = -1;
+    int bytesRead = 0;
 
     // Try to read data from the keyboard and only continue if successful
-    while (read(fd, &event, sizeof(event)) == (int)sizeof(event))
+    while ((bytesRead = (int)read(fd, &event, sizeof(event))) == (int)sizeof(event))
     {
         // Check if the event is a key event
         if (event.type != EV_KEY) continue;
@@ -2248,6 +2395,8 @@ static void PollKeyboardDeviceEvents(int fd)
             }
         }
     }
+
+    return (bytesRead == -1) && (errno == ENODEV);
 }
 
 // Poll gamepad input events
@@ -2263,7 +2412,8 @@ static void PollGamepadEvents(void)
         // Register previous gamepad states
         for (int k = 0; k < MAX_GAMEPAD_BUTTONS; k++) CORE.Input.Gamepad.previousButtonState[i][k] = CORE.Input.Gamepad.currentButtonState[i][k];
 
-        while (read(platform.gamepadStreamFd[i], &event, sizeof(event)) == (int)sizeof(event))
+        int bytesRead = 0;
+        while ((bytesRead = (int)read(platform.gamepadStreamFd[i], &event, sizeof(event))) == (int)sizeof(event))
         {
             if (event.type == EV_KEY)
             {
@@ -2300,13 +2450,52 @@ static void PollGamepadEvents(void)
                 }
             }
         }
+
+        // Disconnected gamepad: close it, its slot stays unused
+        if ((bytesRead == -1) && (errno == ENODEV))
+        {
+            TRACELOG(LOG_INFO, "INPUT: Gamepad %i disconnected", i);
+            close(platform.gamepadStreamFd[i]);
+            platform.gamepadStreamFd[i] = -1;
+            CORE.Input.Gamepad.ready[i] = false;
+        }
     }
 }
 
 // Poll mouse input events
 static void PollMouseEvents(void)
 {
-    for (int i = 0; i < platform.pointerCount; i++) PollMouseDeviceEvents(&platform.pointers[i]);
+    for (int i = 0; i < platform.pointerCount; )
+    {
+        if (PollMouseDeviceEvents(&platform.pointers[i]))
+        {
+            TRACELOG(LOG_INFO, "INPUT: %s disconnected (%s)", platform.pointers[i].isTouch? "Touchscreen" : "Mouse",
+                (platform.pointers[i].phys[0] != '\0')? platform.pointers[i].phys : "no physical path");
+            RemovePointerDevice(i);
+            ReleasePointerInput();
+        }
+        else i++;
+    }
+}
+
+// Release all mouse buttons and touch points, so none stays pressed after its device was removed
+static void ReleasePointerInput(void)
+{
+    for (int i = 0; i < MAX_MOUSE_BUTTONS; i++) platform.currentButtonStateEvdev[i] = 0;
+
+    for (int i = 0; i < MAX_TOUCH_POINTS; i++)
+    {
+        platform.touchActive[i] = false;
+        platform.touchPosition[i].x = -1;
+        platform.touchPosition[i].y = -1;
+        platform.touchId[i] = -1;
+
+        CORE.Input.Touch.position[i].x = -1;
+        CORE.Input.Touch.position[i].y = -1;
+        CORE.Input.Touch.pointId[i] = -1;
+    }
+
+    CORE.Input.Touch.pointCount = 0;
 }
 
 // Register a mouse or touchscreen, takes over the file descriptor
@@ -2342,14 +2531,15 @@ static void RemovePointerDevice(int index)
     if (index < platform.pointerCount) platform.pointers[index] = platform.pointers[platform.pointerCount];
 }
 
-// Poll and process the evdev events of one mouse or touchscreen
-static void PollMouseDeviceEvents(PointerDevice *pointer)
+// Poll and process the evdev events of one mouse or touchscreen, returns true if the device was removed
+static bool PollMouseDeviceEvents(PointerDevice *pointer)
 {
     struct input_event event = { 0 };
     int touchAction = -1;           // 0-TOUCH_ACTION_UP, 1-TOUCH_ACTION_DOWN, 2-TOUCH_ACTION_MOVE
+    int bytesRead = 0;
 
     // Try to read data from the mouse/touch/gesture and only continue if successful
-    while (read(pointer->fd, &event, sizeof(event)) == (int)sizeof(event))
+    while ((bytesRead = (int)read(pointer->fd, &event, sizeof(event))) == (int)sizeof(event))
     {
         // Relative movement parsing
         if (event.type == EV_REL)
@@ -2617,6 +2807,8 @@ static void PollMouseDeviceEvents(PointerDevice *pointer)
         }
 #endif
     }
+
+    return (bytesRead == -1) && (errno == ENODEV);
 }
 
 // Search matching DRM mode in connector's mode list
