@@ -144,6 +144,7 @@ typedef struct {
     struct termios defaultSettings;     // Default keyboard settings
     int *keyboardFds;                   // File descriptors for the evdev keyboards
     int keyboardCount;                  // The number of keyboards registered
+    bool capsLock;                      // Caps Lock toggled on (shared by all keyboards)
 
     // Mouse data
     Vector2 eventWheelMove;             // Registers the event mouse wheel variation
@@ -199,9 +200,16 @@ static PlatformData platform = { 0 };   // Platform specific data
 // backend to *avoid* X11
 static const int evkeyToUnicodeLUT[] = {
     0, 27, 49, 50, 51, 52, 53, 54, 55, 56, 57, 48, 45, 61, 8, 0, 113, 119, 101, 114,
-    116, 121, 117, 105, 111, 112, 0, 0, 13, 0, 97, 115, 100, 102, 103, 104, 106, 107, 108, 59,
+    116, 121, 117, 105, 111, 112, 91, 93, 13, 0, 97, 115, 100, 102, 103, 104, 106, 107, 108, 59,
     39, 96, 0, 92, 122, 120, 99, 118, 98, 110, 109, 44, 46, 47, 0, 0, 0, 32
     // LUT currently incomplete, only mapped the most essential keys
+};
+
+// The characters of evkeyToUnicodeLUT with Shift held, for the US keyboard layout
+static const int evkeyToUnicodeShiftLUT[] = {
+    0, 27, 33, 64, 35, 36, 37, 94, 38, 42, 40, 41, 95, 43, 8, 0, 81, 87, 69, 82,
+    84, 89, 85, 73, 79, 80, 123, 125, 13, 0, 65, 83, 68, 70, 71, 72, 74, 75, 76, 58,
+    34, 126, 0, 124, 90, 88, 67, 86, 66, 78, 77, 60, 62, 63, 0, 0, 0, 32
 };
 
 // This is the map used to map any keycode returned from linux to a raylib code from 'raylib.h'
@@ -287,6 +295,7 @@ static void PollEvdevHotplug(void);             // Configure added input devices
 static void ConfigureEvdevDevice(char *device); // Identifies a input device and configures it for use if appropriate
 static void PollKeyboardEvents(void);           // Process evdev keyboard events
 static bool PollKeyboardDeviceEvents(int fd);   // Process the evdev events of one keyboard, true if it was removed
+static int EvkeyToUnicode(int code);            // Get the character of a pressed evdev key, 0 if it has none
 static void PollGamepadEvents(void);            // Process evdev gamepad events
 static void PollMouseEvents(void);              // Process evdev mouse events
 static bool PollMouseDeviceEvents(PointerDevice *pointer); // Process the evdev events of one mouse or touchscreen, true if it was removed
@@ -2383,10 +2392,13 @@ static bool PollKeyboardDeviceEvents(int fd)
                         CORE.Input.Keyboard.keyPressedQueueCount++;
                     }
 
-                    if (CORE.Input.Keyboard.charPressedQueueCount < MAX_CHAR_PRESSED_QUEUE)
+                    if (keycode == KEY_CAPS_LOCK) platform.capsLock = !platform.capsLock;
+
+                    // NOTE: GetCharPressed() returns 0 for an empty queue, so keys without a character are not queued
+                    int unicode = EvkeyToUnicode(event.code);
+                    if ((unicode > 0) && (CORE.Input.Keyboard.charPressedQueueCount < MAX_CHAR_PRESSED_QUEUE))
                     {
-                        // TODO/FIXME: This is not actually converting to unicode properly because it's not taking things like shift into account
-                        CORE.Input.Keyboard.charPressedQueue[CORE.Input.Keyboard.charPressedQueueCount] = evkeyToUnicodeLUT[event.code];
+                        CORE.Input.Keyboard.charPressedQueue[CORE.Input.Keyboard.charPressedQueueCount] = unicode;
                         CORE.Input.Keyboard.charPressedQueueCount++;
                     }
                 }
@@ -2397,6 +2409,24 @@ static bool PollKeyboardDeviceEvents(int fd)
     }
 
     return (bytesRead == -1) && (errno == ENODEV);
+}
+
+// Get the character of a pressed evdev key for the US keyboard layout, 0 if it has none
+// NOTE: Like GLFW, control characters (Escape, Backspace, Enter) and keys pressed with Ctrl give no character
+static int EvkeyToUnicode(int code)
+{
+    const int lutSize = (int)(sizeof(evkeyToUnicodeLUT)/sizeof(evkeyToUnicodeLUT[0]));
+    if ((code < 0) || (code >= lutSize)) return 0;
+    if (CORE.Input.Keyboard.currentKeyState[KEY_LEFT_CONTROL] || CORE.Input.Keyboard.currentKeyState[KEY_RIGHT_CONTROL]) return 0;
+
+    int unicode = evkeyToUnicodeLUT[code];
+    bool letter = (unicode >= 'a') && (unicode <= 'z');
+    bool shift = CORE.Input.Keyboard.currentKeyState[KEY_LEFT_SHIFT] || CORE.Input.Keyboard.currentKeyState[KEY_RIGHT_SHIFT];
+
+    // Caps Lock only affects letters, and Shift reverts it
+    if (shift != (letter && platform.capsLock)) unicode = evkeyToUnicodeShiftLUT[code];
+
+    return (unicode >= 32)? unicode : 0;
 }
 
 // Poll gamepad input events
