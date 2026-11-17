@@ -1778,6 +1778,12 @@ void ClosePlatform(void)
     RL_FREE(platform.keyboardFds);
     platform.keyboardFds = NULL;
     platform.keyboardCount = 0;
+
+#if SUPPORT_SSH_KEYBOARD_RPI
+    // Restore the terminal now, not only at exit: InitKeyboard() of a later InitWindow()
+    // would otherwise save the modified settings as the ones to restore
+    RestoreKeyboard();
+#endif
 }
 
 #if SUPPORT_SSH_KEYBOARD_RPI
